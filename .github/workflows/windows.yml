@@ -1,0 +1,55 @@
+name: Build Windows EXE
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install packager
+        run: python -m pip install pyinstaller==6.16.0
+      - name: Download FFmpeg and verify checksum
+        shell: pwsh
+        run: |
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          $checksum = (Invoke-WebRequest "$url.sha256").Content
+          $expected = [regex]::Match($checksum, '[a-fA-F0-9]{64}').Value
+          if (!$expected -or (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash -ne $expected) { throw 'FFmpeg checksum mismatch' }
+          Expand-Archive ffmpeg.zip -DestinationPath vendor
+          $root = (Get-ChildItem vendor -Directory | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force bin,licenses | Out-Null
+          Copy-Item "$root/bin/ffmpeg.exe","$root/bin/ffprobe.exe" bin
+          Copy-Item "$root/LICENSE" licenses/FFmpeg-LICENSE.txt
+          Copy-Item "$root/README.txt" licenses/FFmpeg-README.txt
+          Set-Content licenses/BUILD.txt "FFmpeg package: $url`nSHA256: $expected`nSource and build information: https://www.gyan.dev/ffmpeg/builds/"
+      - name: Build single executable
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name SceneSnap --add-binary "bin/ffmpeg.exe;bin" --add-binary "bin/ffprobe.exe;bin" --add-data "licenses;licenses" scenesnap.py
+      - name: Test executable on Windows
+        shell: pwsh
+        run: |
+          $result = Join-Path $pwd 'test-result.txt'
+          $process = Start-Process -FilePath dist/SceneSnap.exe -ArgumentList @('--self-test', "`"$result`"") -PassThru
+          if (!$process.WaitForExit(180000)) { $process.Kill(); throw 'EXE test timed out' }
+          if (!(Test-Path $result)) { throw 'EXE produced no test result' }
+          Get-Content $result
+          if ($process.ExitCode -ne 0 -or !(Select-String -Path $result -Pattern '^PASS:')) { throw 'EXE test failed' }
+          Get-FileHash dist/SceneSnap.exe -Algorithm SHA256 | Format-List | Out-File dist/SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SceneSnap-Windows-x64
+          path: |
+            dist/SceneSnap.exe
+            dist/SHA256.txt
+            test-result.txt
+            licenses/
+          retention-days: 30
