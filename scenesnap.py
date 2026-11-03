@@ -1,5 +1,5 @@
 """SceneSnap: local scene timestamp to image exporter. Python 3.10+."""
-import csv, html, json, os, queue, re, shutil, subprocess, sys, threading, uuid
+import bisect, csv, html, json, os, queue, re, shutil, subprocess, sys, threading, uuid
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -60,6 +60,33 @@ def run(args, stop=None):
     finally:
         if p.poll() is None: p.kill(); p.wait()
 
+def frame_timeline(video, ffprobe, origin, stop):
+    data = json.loads(run([ffprobe, '-v', 'error', '-select_streams', 'v:0',
+        '-show_frames', '-show_entries', 'frame=best_effort_timestamp_time',
+        '-of', 'json', str(video)], stop))
+    times = sorted(set(round(float(f['best_effort_timestamp_time']) - origin, 6)
+        for f in data.get('frames', []) if 'best_effort_timestamp_time' in f))
+    if not times: raise ValueError('Unable to read the video frame timestamps.')
+    return times
+
+def sample_frames(times, start, end, count):
+    # End is exclusive: do not select a frame belonging to the following scene.
+    left = bisect.bisect_left(times, start - 1e-7)
+    right = bisect.bisect_left(times, end - 1e-7)
+    if left >= right:
+        raise ValueError(f'No video frame starts inside {start:.3f}–{end:.3f}s.')
+    if count == 1: return [times[left]]
+    result = []
+    for i in range(count):
+        if i == 0: index = left
+        elif i == count-1: index = right-1
+        else:
+            target = start + (end-start)*i/(count-1)
+            index = min(right-1, bisect.bisect_left(times, target))
+            if index > left and abs(times[index-1]-target) <= abs(times[index]-target): index -= 1
+        result.append(times[index])
+    return result
+
 def export(video, rows, count, output, ffmpeg, ffprobe, stop, progress):
     info = json.loads(run([ffprobe, '-v', 'error', '-show_format', '-show_streams', '-of', 'json', str(video)], stop))
     if not any(s.get('codec_type') == 'video' for s in info.get('streams', [])):
@@ -67,23 +94,22 @@ def export(video, rows, count, output, ffmpeg, ffprobe, stop, progress):
     duration = float(info['format']['duration'])
     if max(r[2] for r in rows) > duration + 0.15:
         raise ValueError(f'Scenes end at {max(r[2] for r in rows):.1f}s but video lasts {duration:.1f}s. Select the matching original video.')
+    times = frame_timeline(video, ffprobe, float(info['format'].get('start_time', 0)), stop)
     folder = Path(output) / ('SceneSnap_' + datetime.now().strftime('%Y%m%d_%H%M%S_') + uuid.uuid4().hex[:6])
     folder.mkdir(parents=True)
     cards = []
     done = 0
     with (folder / 'snapshots.csv').open('w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['scene','start_seconds','end_seconds','requested_snapshot_seconds','image'])
+        writer.writerow(['scene','start_seconds','end_seconds','snapshot_seconds','image'])
         try:
             for scene, start, end in rows:
                 images = []
-                for j in range(count):
+                for j, t in enumerate(sample_frames(times, start, end, count)):
                     if stop.is_set(): raise InterruptedError('Cancelled. Completed images are retained.')
-                    # Interior sample positions avoid scene boundaries; one image uses midpoint.
-                    t = start + (end-start)*(j+1)/(count+1)
-                    name = f'scene_{scene:04d}_{j+1:02d}_{t:010.3f}s.png'
+                    name = f'videoframe_{scene}_{j+1}.png'
                     path = folder / name
-                    run([ffmpeg, '-nostdin', '-v', 'error', '-ss', f'{t:.6f}', '-i', str(video), '-map', '0:v:0', '-frames:v', '1', '-update', '1', str(path)], stop)
+                    run([ffmpeg, '-nostdin', '-v', 'error', '-ss', f'{max(0, t-0.000001):.6f}', '-i', str(video), '-map', '0:v:0', '-frames:v', '1', '-update', '1', str(path)], stop)
                     if not path.exists() or path.stat().st_size == 0:
                         raise RuntimeError(f'No frame available for scene {scene} at {t:.3f}s.')
                     writer.writerow([scene,start,end,round(t,6),name]); f.flush()
@@ -92,7 +118,7 @@ def export(video, rows, count, output, ffmpeg, ffprobe, stop, progress):
                     progress(done, len(rows)*count, str(folder))
                 cards.append(f'<section><h2>Scene {scene} <small>{start:.1f}–{end:.1f}s</small></h2><div>{"".join(images)}</div></section>')
         finally:
-            (folder/'gallery.html').write_text('<!doctype html><meta charset="utf-8"><title>SceneSnap gallery</title><style>body{background:#0d1729;color:#e7eefb;font:16px system-ui;margin:32px}h1{color:#8fbaff}small{font-size:14px;color:#9eb0ca}section{margin:28px 0}div{display:flex;flex-wrap:wrap;gap:12px}a{width:300px;color:#b8d4ff;text-decoration:none}img{width:100%;display:block;border-radius:8px}span{display:block;padding:8px}</style><h1>SceneSnap gallery</h1><p>Requested sample times; actual frames depend on the video frame rate. Partial exports show completed scenes.</p>'+''.join(cards), encoding='utf-8')
+            (folder/'gallery.html').write_text('<!doctype html><meta charset="utf-8"><title>SceneSnap gallery</title><style>body{background:#0d1729;color:#e7eefb;font:16px system-ui;margin:32px}h1{color:#8fbaff}small{font-size:14px;color:#9eb0ca}section{margin:28px 0}div{display:flex;flex-wrap:wrap;gap:12px}a{width:300px;color:#b8d4ff;text-decoration:none}img{width:100%;display:block;border-radius:8px}span{display:block;padding:8px}</style><h1>SceneSnap gallery</h1><p>Selected frame times. Scene end times are exclusive. Partial exports show completed scenes.</p>'+''.join(cards), encoding='utf-8')
     return folder
 
 class App(tk.Tk):
@@ -124,7 +150,7 @@ class App(tk.Tk):
         ttk.Label(options,text='Images per scene').pack(side='left')
         self.count=tk.StringVar(value='3'); ttk.Spinbox(options,from_=1,to=20,width=5,textvariable=self.count).pack(side='left',padx=10)
         ttk.Button(options,text='Validate scenes',command=self.validate).pack(side='left')
-        ttk.Label(options,text='1 = midpoint · 3 = 25%, 50%, 75%').pack(side='right')
+        ttk.Label(options,text='1: first · 2: first/last · 3: first/middle/last').pack(side='right')
         self.status=tk.StringVar(value='Ready. Paste or import your scene list.')
         ttk.Label(box,textvariable=self.status,wraplength=850).grid(row=9,column=0,columnspan=3,sticky='w')
         self.progress=ttk.Progressbar(box,maximum=100); self.progress.grid(row=10,column=0,columnspan=3,sticky='ew',pady=12)
@@ -166,7 +192,7 @@ class App(tk.Tk):
         except Exception as e: messagebox.showerror('Setup required',str(e)); return
         args=(self.video.get(),rows,count,self.output.get(),self.ffmpeg.get(),self.ffprobe.get())
         self.stop.clear(); self.busy=True; self.folder=None; self.progress['value']=0
-        self.start['state']='disabled'; self.cancel['state']='normal'; self.status.set('Checking video…')
+        self.start['state']='disabled'; self.cancel['state']='normal'; self.status.set('Indexing video frames for accurate scene boundaries…')
         def worker():
             try:
                 folder=export(*args,self.stop,lambda n,total,path:self.events.put(('progress',n,total,path)))
@@ -202,11 +228,24 @@ def self_test(destination):
         with tempfile.TemporaryDirectory() as d:
             video = Path(d)/'test.mp4'
             run([find_tool('ffmpeg'), '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25:duration=3', '-c:v', 'mpeg4', str(video)])
-            folder = export(video, [(1,0,1),(2,1,3)], 3, d, find_tool('ffmpeg'), find_tool('ffprobe'), threading.Event(), lambda *args: None)
-            assert len(list(folder.glob('*.png'))) == 6
-            assert all(p.stat().st_size > 100 for p in folder.glob('*.png'))
+            times = frame_timeline(video, find_tool('ffprobe'), 0, threading.Event())
+            assert sample_frames(times, 0, 1, 1) == [0]
+            assert sample_frames(times, 0, 1, 2) == [0, 0.96]
+            assert sample_frames(times, 0, 1, 3) == [0, 0.48, 0.96]
+            assert sample_frames([0, 0.08, 0.23, 0.47, 0.9, 1.0], 0.07, 1.0, 3) == [0.08, 0.47, 0.9]
+            for count in (1,2,3):
+                folder = export(video, [(1,0,1),(2,1,3)], count, d, find_tool('ffmpeg'), find_tool('ffprobe'), threading.Event(), lambda *args: None)
+                assert len(list(folder.glob('*.png'))) == count*2
+                records = list(csv.DictReader((folder/'snapshots.csv').open()))
+                assert [r['image'] for r in records] == [f'videoframe_{scene}_{i}.png' for scene in (1,2) for i in range(1,count+1)]
+                # Compare output pixels with independently decoded frame-index references.
+                for record in records:
+                    index = round(float(record['snapshot_seconds'])*25)
+                    reference = Path(d)/'reference.png'
+                    run([find_tool('ffmpeg'), '-y', '-v', 'error', '-i', str(video), '-vf', f'select=eq(n\\,{index})', '-frames:v', '1', '-update', '1', str(reference)])
+                    assert reference.read_bytes() == (folder/record['image']).read_bytes()
             app = App(); app.update(); app.destroy()
-        Path(destination).write_text('PASS: packaged FFmpeg/FFprobe, six PNG snapshots, CSV/gallery, and native window initialization.', encoding='utf-8')
+        Path(destination).write_text('PASS: counts 1/2/3; first/middle/last frame pixels; boundary exclusion; variable timestamps; filenames; packaged tools and native window.', encoding='utf-8')
     except Exception:
         import traceback
         Path(destination).write_text(traceback.format_exc(), encoding='utf-8')
